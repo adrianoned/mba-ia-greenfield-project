@@ -34,6 +34,10 @@ docker compose exec nestjs-api npm run start:dev
 Services:
 - `nestjs-api` — NestJS API, port `3000`
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `mailpit` — SMTP catch-all, port `1025` (SMTP) / `8025` (web UI)
+- `minio` — S3-compatible object storage, port `9000` (S3 API) / `9001` (console)
+- `redis` — Redis 7, port `6379` (BullMQ queue backend)
+- `video-worker` — FFmpeg worker consuming the `video-processing` queue
 
 All verification and teardown commands run on the **host machine**:
 
@@ -148,6 +152,18 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
+
+## Video Processing (Phase 03)
+
+The `VideosModule` (`src/videos/`) implements video upload, storage, background processing, and streaming:
+
+- **Upload (presigned multipart):** `POST /videos/uploads` pre-registers a `draft` video and starts a multipart upload in MinIO. `POST /videos/uploads/:videoId/parts` returns presigned `UploadPart` URLs; the client uploads each part **directly to storage** (the bytes never pass through the API). `POST /videos/uploads/:videoId/complete` finalizes the multipart upload and enqueues a `process-video` job.
+- **Queue & worker:** BullMQ (`@nestjs/bullmq`) + Redis. `VideosService.completeUpload` enqueues `process-video` jobs on the `video-processing` queue. The `video-worker` container (FFmpeg/ffprobe installed) runs `VideoProcessingProcessor` (`src/videos/video-processing.processor.ts`), which extracts duration/metadata via `ffprobe`, generates a thumbnail via `ffmpeg`, uploads it to the `thumbnails` bucket, and transitions the video `draft → processing → ready` (or `error`).
+- **Streaming/download:** `GET /videos/:id/stream` proxies the object from storage honoring HTTP `Range` requests (`206 Partial Content`) for streaming and full-body (`200`) for download. `GET /videos/:id` returns public metadata.
+- **Storage:** S3-compatible via `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`, pointing at MinIO (`S3_ENDPOINT`, `forcePathStyle`). `StorageService` (`src/videos/storage.service.ts`) creates the `videos` and `thumbnails` buckets on bootstrap, and wraps presigned/multipart/range operations.
+- **Entity:** `Video` (`src/videos/entities/video.entity.ts`) — uuid public id, `channel_id` FK, `status` enum (`draft|processing|ready|error`), `storage_key`, `thumbnail_key`, `duration`, `metadata` (jsonb), `error_message`. Migration: `src/database/migrations/1795631156556-CreateVideos.ts`.
+
+Endpoints are protected by the global JWT guard; `@Public()` marks the metadata (`GET /videos/:id`) and stream (`GET /videos/:id/stream`) endpoints for anonymous access.
 
 ## Code Conventions
 
